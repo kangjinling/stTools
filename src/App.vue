@@ -4,9 +4,9 @@ import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from
 const REFRESH_SECONDS = 45;
 
 const params = reactive({
-  symbol: "AAPL",
+  symbol: "600519",
   range: "6mo",
-  interval: "1d",
+  interval: "day",
   fastPeriod: 12,
   slowPeriod: 26,
   signalPeriod: 9,
@@ -34,7 +34,6 @@ let refreshTimer = null;
 let countdownTimer = null;
 let requestId = 0;
 
-const normalizedSymbol = computed(() => params.symbol.trim().toUpperCase());
 const latestSignalClass = computed(() => `signal-pill ${latestSignal.value?.tone || "neutral"}`);
 const scoreLabel = computed(() => latestSignal.value ? `${latestSignal.value.score}/100` : "--");
 const refreshLabel = computed(() => params.autoRefresh ? `${countdown.value}s 后刷新` : "手动刷新");
@@ -57,8 +56,8 @@ const summaryCards = computed(() => {
 });
 
 async function fetchMarketData() {
-  const symbol = normalizedSymbol.value;
-  if (!symbol) {
+  const stock = parseChinaStockSymbol(params.symbol);
+  if (!stock) {
     errorMessage.value = "请输入股票代码。";
     return;
   }
@@ -74,17 +73,17 @@ async function fetchMarketData() {
   errorMessage.value = "";
 
   try {
-    const url = `/api/chart/${encodeURIComponent(symbol)}?range=${effectiveRange()}&interval=${params.interval}&includePrePost=false`;
+    const url = buildTencentKlineUrl(stock);
     const response = await fetch(url);
     if (!response.ok) {
       if (response.status === 429) {
-        throw new Error("行情源限流：Yahoo Finance 拒绝了当前请求。请稍后重试，或接入带 API Key 的正式行情源。");
+        throw new Error("行情源限流：腾讯证券拒绝了当前请求，请稍后重试。");
       }
       throw new Error(`行情接口返回 ${response.status}`);
     }
 
     const payload = await response.json();
-    const rows = parseYahooChart(payload);
+    const rows = parseTencentKline(payload, stock);
     if (rows.length < params.slowPeriod + params.signalPeriod + 5) {
       throw new Error("行情样本不足，请调大时间范围或换成日线周期。");
     }
@@ -97,7 +96,7 @@ async function fetchMarketData() {
     const latest = evaluateBuyPoint(enriched);
     analyzedRows.value = enriched;
     latestSignal.value = latest;
-    quote.value = buildQuote(payload, latest, enriched);
+    quote.value = buildQuote(payload, latest, stock);
     historySignals.value = enriched.filter((row) => row.signal !== "HOLD").slice(-20).reverse();
     status.value = "行情已更新";
     lastUpdated.value = new Date().toLocaleString("zh-CN", { hour12: false });
@@ -118,53 +117,95 @@ async function fetchMarketData() {
   }
 }
 
-function parseYahooChart(payload) {
-  const result = payload?.chart?.result?.[0];
-  const error = payload?.chart?.error;
-  if (error) {
-    throw new Error(error.description || "行情接口错误。");
+function buildTencentKlineUrl(stock) {
+  const paramsObject = new URLSearchParams({
+    param: `${stock.tencentSymbol},day,,,${historyLimit()},qfq`
+  });
+  return `/api/tencent/appstock/app/fqkline/get?${paramsObject.toString()}`;
+}
+
+function parseTencentKline(payload, stock) {
+  if (payload?.code !== 0) {
+    throw new Error(payload?.msg || "腾讯证券行情接口返回异常。");
   }
-  if (!result?.timestamp?.length) {
+  const stockData = payload?.data?.[stock.tencentSymbol];
+  const klines = stockData?.qfqday || stockData?.day;
+  if (!klines?.length) {
     throw new Error("没有获取到行情数据，请检查股票代码。");
   }
 
-  const quoteData = result.indicators?.quote?.[0] || {};
-  const timestamps = result.timestamp;
-  const rows = timestamps.map((timestamp, index) => ({
-    date: formatTimestamp(timestamp, result.meta?.exchangeTimezoneName),
-    open: Number(quoteData.open?.[index]),
-    high: Number(quoteData.high?.[index]),
-    low: Number(quoteData.low?.[index]),
-    close: Number(quoteData.close?.[index]),
-    volume: Number(quoteData.volume?.[index] || 0)
-  })).filter((row) => (
+  return klines.map((line) => {
+    const [date, open, close, high, low, volume] = line;
+    return {
+      date,
+      open: Number(open),
+      high: Number(high),
+      low: Number(low),
+      close: Number(close),
+      volume: Number(volume)
+    };
+  }).filter((row) => (
     row.date
-    && [row.open, row.high, row.low, row.close].every(Number.isFinite)
-    && Number.isFinite(row.volume)
+    && [row.open, row.high, row.low, row.close, row.volume].every(Number.isFinite)
   ));
-
-  return rows;
 }
 
-function buildQuote(payload, latest) {
-  const meta = payload?.chart?.result?.[0]?.meta || {};
+function buildQuote(payload, latest, stock) {
+  const stockData = payload?.data?.[stock.tencentSymbol] || {};
+  const qt = stockData.qt?.[stock.tencentSymbol] || [];
   return {
-    symbol: meta.symbol || normalizedSymbol.value,
-    exchange: meta.exchangeName || "--",
-    currency: meta.currency || "",
-    regularMarketPrice: meta.regularMarketPrice || latest.close,
-    regularMarketTime: meta.regularMarketTime ? formatTimestamp(meta.regularMarketTime, meta.exchangeTimezoneName) : latest.date
+    symbol: `${stock.exchangeLabel}${stock.code}`,
+    name: qt[1] || "--",
+    exchange: stock.exchangeName,
+    currency: "CNY",
+    regularMarketPrice: latest.close,
+    regularMarketTime: latest.date
   };
 }
 
-function effectiveRange() {
-  if (params.interval === "1d") {
-    return params.range;
+function parseChinaStockSymbol(input) {
+  const normalized = normalizeChinaSymbol(input);
+  const code = normalized.replace(/^(SH|SZ)/, "").replace(/\.(SH|SZ)$/, "");
+  if (!/^\d{6}$/.test(code)) {
+    return null;
   }
-  if (params.interval === "1h") {
-    return params.range === "1y" ? "3mo" : params.range;
+
+  const market = inferChinaMarket(code, normalized);
+  return {
+    code,
+    market,
+    secid: `${market}.${code}`,
+    tencentSymbol: `${market === 1 ? "sh" : "sz"}${code}`,
+    exchangeLabel: market === 1 ? "SH" : "SZ",
+    exchangeName: market === 1 ? "上交所" : "深交所"
+  };
+}
+
+function normalizeChinaSymbol(input) {
+  return input.trim().toUpperCase().replace(/\s+/g, "");
+}
+
+function inferChinaMarket(code, normalized) {
+  if (normalized.startsWith("SH") || normalized.endsWith(".SH")) {
+    return 1;
   }
-  return ["1mo", "3mo"].includes(params.range) ? "1mo" : "5d";
+  if (normalized.startsWith("SZ") || normalized.endsWith(".SZ")) {
+    return 0;
+  }
+  if (/^(5|6|9|688|689)/.test(code)) {
+    return 1;
+  }
+  return 0;
+}
+
+function historyLimit() {
+  const map = {
+    "1mo": "30",
+    "3mo": "90",
+    "6mo": "180",
+    "1y": "260"
+  };
+  return map[params.range] || "180";
 }
 
 function analyzeRows(rows) {
@@ -449,15 +490,6 @@ function smaSeries(values, period) {
   return series;
 }
 
-function formatTimestamp(timestamp, timeZone) {
-  const date = new Date(timestamp * 1000);
-  const options = params.interval.includes("m")
-    ? { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }
-    : { year: "numeric", month: "2-digit", day: "2-digit" };
-  if (timeZone) options.timeZone = timeZone;
-  return new Intl.DateTimeFormat("zh-CN", options).format(date).replaceAll("/", "-");
-}
-
 function formatNumber(value, digits) {
   return Number(value).toFixed(digits);
 }
@@ -495,7 +527,7 @@ function stopTimers() {
 watch(
   () => [params.range, params.interval, params.fastPeriod, params.slowPeriod, params.signalPeriod, params.volumeMAPeriod, params.volumeMultiplier, params.stopLossPct],
   () => {
-    if (normalizedSymbol.value) fetchMarketData();
+    if (parseChinaStockSymbol(params.symbol)) fetchMarketData();
   }
 );
 
@@ -528,7 +560,7 @@ onUnmounted(stopTimers);
           <span>股票代码</span>
           <input
             v-model="params.symbol"
-            placeholder="AAPL / TSLA / 0700.HK / 600519.SS"
+            placeholder="600519 / 000001 / SH600519 / 000001.SZ"
             @keyup.enter="fetchMarketData"
           >
         </label>
@@ -544,12 +576,9 @@ onUnmounted(stopTimers);
         </label>
 
         <label>
-          <span>K线</span>
+          <span>行情源</span>
           <select v-model="params.interval">
-            <option value="5m">5分钟</option>
-            <option value="15m">15分钟</option>
-            <option value="1h">1小时</option>
-            <option value="1d">日线</option>
+            <option value="day">腾讯证券 · 前复权日线</option>
           </select>
         </label>
 
@@ -567,7 +596,7 @@ onUnmounted(stopTimers);
 
       <section v-if="quote && latestSignal" class="signal-strip">
         <div class="quote-block">
-          <span>{{ quote.symbol }} · {{ quote.exchange }} · {{ quote.currency }}</span>
+          <span>{{ quote.symbol }} · {{ quote.name }} · {{ quote.exchange }} · {{ quote.currency }}</span>
           <strong>{{ formatNumber(latestSignal.close, 2) }}</strong>
           <small>{{ latestSignal.changePct >= 0 ? "+" : "" }}{{ latestSignal.changePct.toFixed(2) }}% · {{ lastUpdated }}</small>
         </div>
