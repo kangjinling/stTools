@@ -1,0 +1,44 @@
+:root {
+  --bg: #07111f;
+  --bg-soft: #0c1b30;
+  --panel: rgba(10, 24, 43, 0.9);
+  --panel-border: rgba(126, 155, 201, 0.18);
+  --text: #edf5ff;
+  --muted: #8ea3bf;
+  --accent: #5cd8ff;
+  --accent-2: #ffe082;
+  --up: #5ef0a9;
+  --down: #ff7a7a;
+  --neutral: #8ca1bc;
+  --shadow: 0 24px 60px rgba(0, 0, 0, 0.28);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: "Avenir Next", "Trebuchet MS", "PingFang SC", "Noto Sans SC", sans-serif;
+  color: var(--text);
+  background:
+    radial-gradient(circle at top left, rgba(92, 216, 255, 0.18), transparent 24%),
+    radial-gradient(circle at top right, rgba(255, 224, 130, 0.12), transparent 22%),
+    linear-gradient(180deg, #07101d 0%, #040914 100%);
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+}
+
+code {
+  color: var(--accent-2);
+}
